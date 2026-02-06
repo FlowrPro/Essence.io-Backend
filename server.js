@@ -104,14 +104,23 @@ wss.on('connection', (ws) => {
   ws.on('message', (rawData) => {
     try {
       const packet = JSON.parse(rawData);
+      console.log(`[SERVER] Received packet type: ${packet.type || packet.data?.type}`);
+      console.log(`[SERVER] Packet:`, packet);
 
-      switch (packet.type) {
+      // Handle the message type - could be at packet.type or packet.data.type
+      const messageType = packet.type || packet.data?.type;
+
+      switch (messageType) {
         case 'join':
-          handlePlayerJoin(connection, packet.data);
+          console.log(`[SERVER] Handling join request`);
+          const joinData = packet.data?.data || packet.data || {};
+          console.log(`[SERVER] Join data:`, joinData);
+          handlePlayerJoin(connection, joinData);
           break;
 
         case 'input':
-          handlePlayerInput(connection, packet.data);
+          const inputData = packet.data?.input || packet.data?.data || {};
+          handlePlayerInput(connection, inputData);
           break;
 
         case 'ping':
@@ -123,10 +132,11 @@ wss.on('connection', (ws) => {
           break;
 
         default:
-          console.warn(`Unknown message type: ${packet.type}`);
+          console.warn(`[SERVER] Unknown message type: ${messageType}`);
       }
     } catch (error) {
       console.error(`[ERROR] Failed to parse message: ${error.message}`);
+      console.error(`[ERROR] Raw data: ${rawData}`);
     }
   });
 
@@ -142,27 +152,39 @@ wss.on('connection', (ws) => {
 });
 
 function handlePlayerJoin(connection, data) {
-  const player = gameWorld.addPlayer(connection.clientId, data.playerName || `Player_${connection.clientId}`);
+  console.log(`[SERVER] handlePlayerJoin called with data:`, data);
+  
+  const playerName = data.playerName || `Player_${connection.clientId}`;
+  console.log(`[SERVER] Creating player: ${playerName}`);
+  
+  const player = gameWorld.addPlayer(connection.clientId, playerName);
   connection.player = player;
   
-  const snapshot = gameWorld.getWorldSnapshot(player.id);
+  console.log(`[SERVER] Player created:`, player);
   
-  // FIX: Send the snapshot with proper structure that client expects
-  connection.send({
+  const snapshot = gameWorld.getWorldSnapshot(player.id);
+  console.log(`[SERVER] Generated snapshot:`, snapshot);
+  
+  // Send worldSnapshot with the exact structure the client expects
+  const worldSnapshotMessage = {
     type: 'worldSnapshot',
     clientId: connection.clientId,
     players: snapshot.players || [],
     essences: snapshot.essences || [],
     npcs: snapshot.npcs || []
-  }, 'critical');
+  };
+  
+  console.log(`[SERVER] Sending worldSnapshot to ${playerName}:`, worldSnapshotMessage);
+  connection.send(worldSnapshotMessage, 'critical');
 
+  // Notify other players
   broadcastToAllExcept(connection, {
     type: 'playerJoined',
     playerId: player.id,
     playerData: player.getPublicData()
   });
 
-  console.log(`[GAME] ${player.name} joined the game`);
+  console.log(`[GAME] ${playerName} joined the game`);
 }
 
 function handlePlayerInput(connection, data) {
