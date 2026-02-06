@@ -146,9 +146,14 @@ function handlePlayerJoin(connection, data) {
   connection.player = player;
   
   const snapshot = gameWorld.getWorldSnapshot(player.id);
+  
+  // FIX: Send the snapshot with proper structure that client expects
   connection.send({
     type: 'worldSnapshot',
-    data: snapshot
+    clientId: connection.clientId,
+    players: snapshot.players || [],
+    essences: snapshot.essences || [],
+    npcs: snapshot.npcs || []
   }, 'critical');
 
   broadcastToAllExcept(connection, {
