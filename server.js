@@ -63,8 +63,10 @@ class ClientConnection {
         id: Math.random(),
         timestamp: Date.now(),
         priority,
+        type: message.type,
         data: message
       };
+      console.log(`[SERVER SENDING] To client ${this.clientId}:`, packet);
       this.ws.send(JSON.stringify(packet));
     }
   }
@@ -89,7 +91,7 @@ wss.on('connection', (ws) => {
   const connection = new ClientConnection(ws, clientId);
   clients.set(ws, connection);
 
-  console.log(`[SERVER] Client connected: ${clientId}`);
+  console.log(`\n[SERVER] ✅ Client connected: ${clientId}`);
 
   connection.send({
     type: 'init',
@@ -103,27 +105,33 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (rawData) => {
     try {
+      console.log(`\n[SERVER] 📨 Raw message received from ${clientId}:`, rawData.substring(0, 200));
+      
       const packet = JSON.parse(rawData);
-      console.log(`[SERVER] Received packet type: ${packet.type || packet.data?.type}`);
-      console.log(`[SERVER] Packet:`, packet);
+      console.log(`[SERVER] Parsed packet:`, packet);
 
-      // Handle the message type - could be at packet.type or packet.data.type
-      const messageType = packet.type || packet.data?.type;
+      // The packet structure from client is:
+      // { type: 'join', data: {...}, timestamp: ..., priority: 'critical' }
+      const messageType = packet.type;
+      console.log(`[SERVER] Message type: ${messageType}`);
 
       switch (messageType) {
         case 'join':
-          console.log(`[SERVER] Handling join request`);
-          const joinData = packet.data?.data || packet.data || {};
-          console.log(`[SERVER] Join data:`, joinData);
-          handlePlayerJoin(connection, joinData);
+          console.log(`[SERVER] 🎮 HANDLING JOIN`);
+          // packet.data contains the actual message data
+          const joinPayload = packet.data.data || packet.data;
+          console.log(`[SERVER] Join payload:`, joinPayload);
+          handlePlayerJoin(connection, joinPayload);
           break;
 
         case 'input':
-          const inputData = packet.data?.input || packet.data?.data || {};
-          handlePlayerInput(connection, inputData);
+          console.log(`[SERVER] 📥 Handling input`);
+          const inputPayload = packet.data.input || packet.data;
+          handlePlayerInput(connection, inputPayload);
           break;
 
         case 'ping':
+          console.log(`[SERVER] 🏓 Handling ping`);
           handlePing(connection, packet);
           break;
 
@@ -132,18 +140,19 @@ wss.on('connection', (ws) => {
           break;
 
         default:
-          console.warn(`[SERVER] Unknown message type: ${messageType}`);
+          console.warn(`[SERVER] ⚠️ Unknown message type: ${messageType}`);
       }
     } catch (error) {
-      console.error(`[ERROR] Failed to parse message: ${error.message}`);
-      console.error(`[ERROR] Raw data: ${rawData}`);
+      console.error(`[SERVER ERROR] Failed to parse message: ${error.message}`);
+      console.error(`[SERVER ERROR] Stack:`, error.stack);
+      console.error(`[SERVER ERROR] Raw data:`, rawData.substring(0, 500));
     }
   });
 
   ws.on('close', () => {
     handlePlayerDisconnect(connection);
     clients.delete(ws);
-    console.log(`[SERVER] Client disconnected: ${clientId}`);
+    console.log(`[SERVER] ❌ Client disconnected: ${clientId}`);
   });
 
   ws.on('error', (error) => {
@@ -152,39 +161,55 @@ wss.on('connection', (ws) => {
 });
 
 function handlePlayerJoin(connection, data) {
-  console.log(`[SERVER] handlePlayerJoin called with data:`, data);
+  console.log(`\n[SERVER] 🎮 handlePlayerJoin called`);
+  console.log(`[SERVER] Data received:`, data);
   
-  const playerName = data.playerName || `Player_${connection.clientId}`;
-  console.log(`[SERVER] Creating player: ${playerName}`);
+  const playerName = data.playerName || data.name || `Player_${connection.clientId}`;
+  console.log(`[SERVER] Creating player with name: ${playerName}`);
   
-  const player = gameWorld.addPlayer(connection.clientId, playerName);
-  connection.player = player;
-  
-  console.log(`[SERVER] Player created:`, player);
-  
-  const snapshot = gameWorld.getWorldSnapshot(player.id);
-  console.log(`[SERVER] Generated snapshot:`, snapshot);
-  
-  // Send worldSnapshot with the exact structure the client expects
-  const worldSnapshotMessage = {
-    type: 'worldSnapshot',
-    clientId: connection.clientId,
-    players: snapshot.players || [],
-    essences: snapshot.essences || [],
-    npcs: snapshot.npcs || []
-  };
-  
-  console.log(`[SERVER] Sending worldSnapshot to ${playerName}:`, worldSnapshotMessage);
-  connection.send(worldSnapshotMessage, 'critical');
+  try {
+    const player = gameWorld.addPlayer(connection.clientId, playerName);
+    connection.player = player;
+    
+    console.log(`[SERVER] Player created:`, {
+      id: player.id,
+      name: player.name,
+      position: player.position
+    });
+    
+    const snapshot = gameWorld.getWorldSnapshot(player.id);
+    console.log(`[SERVER] Generated snapshot:`, {
+      clientId: connection.clientId,
+      playersCount: snapshot.players?.length || 0,
+      essencesCount: snapshot.essences?.length || 0,
+      npcsCount: snapshot.npcs?.length || 0
+    });
+    
+    // Send worldSnapshot with the exact structure the client expects
+    const worldSnapshotMessage = {
+      type: 'worldSnapshot',
+      clientId: connection.clientId,
+      players: snapshot.players || [],
+      essences: snapshot.essences || [],
+      npcs: snapshot.npcs || []
+    };
+    
+    console.log(`[SERVER] 📤 Sending worldSnapshot to ${playerName}`);
+    connection.send(worldSnapshotMessage, 'critical');
+    console.log(`[SERVER] ✅ worldSnapshot sent!`);
 
-  // Notify other players
-  broadcastToAllExcept(connection, {
-    type: 'playerJoined',
-    playerId: player.id,
-    playerData: player.getPublicData()
-  });
+    // Notify other players
+    broadcastToAllExcept(connection, {
+      type: 'playerJoined',
+      playerId: player.id,
+      playerData: player.getPublicData()
+    });
 
-  console.log(`[GAME] ${playerName} joined the game`);
+    console.log(`[GAME] 👤 ${playerName} joined the game`);
+  } catch (error) {
+    console.error(`[SERVER ERROR] Failed to create player: ${error.message}`);
+    console.error(error.stack);
+  }
 }
 
 function handlePlayerInput(connection, data) {
@@ -216,7 +241,7 @@ function handlePlayerDisconnect(connection) {
       playerId: connection.player.id
     });
 
-    console.log(`[GAME] ${connection.player.name} left the game`);
+    console.log(`[GAME] 👤 ${connection.player.name} left the game`);
   }
 }
 
@@ -300,16 +325,16 @@ setInterval(() => {
       return;
     }
     connection.isAlive = false;
-    connection.send({ type: 'ping', timestamp: now });
+    connection.send({ type: 'ping', timestamp: now }, 'critical');
   });
 }, 30000);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`🎮 [SERVER] Essence.io Server running on port ${PORT}`);
+  console.log(`\n🎮 [SERVER] Essence.io Server running on port ${PORT}`);
   console.log(`📡 WebSocket: ws://localhost:${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV}`);
-  console.log(`✅ Ready for connections!`);
+  console.log(`✅ Ready for connections!\n`);
 });
 
 module.exports = { server, gameWorld };
