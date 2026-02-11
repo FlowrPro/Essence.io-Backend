@@ -1,340 +1,279 @@
-const express = require('express');
+/**
+ * Minimal robust WebSocket game server for Essence.io
+ * - Safe message parsing (handles string, Buffer, ArrayBuffer)
+ * - Sends an 'init' packet on connect
+ * - Handles 'join', 'input', 'ping' messages
+ * - Simple game loop that broadcasts a worldSnapshot periodically
+ *
+ * NOTE: This is a standalone replacement/skeleton that you can adapt to your existing server.
+ *       It deliberately avoids calling `.substring` on raw frames and logs helpful diagnostics.
+ */
+
 const http = require('http');
 const WebSocket = require('ws');
-const cors = require('cors');
-require('dotenv').config();
 
-const { GameWorld } = require('./systems/GameWorld');
-const { GameConfig } = require('./config/GameConfig');
+const PORT = process.env.PORT || 8080;
+const TICK_RATE = 20; // server updates per second for world snapshots
+const WORLD_SIZE = { width: 4000, height: 4000 };
+const INTERPOLATION_DELAY = 100; // ms, example config sent to client
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ 
-  server, 
-  perMessageDeflate: false,
-  verifyClient: (info) => {
-    const origin = info.origin || info.req.headers.origin;
-    const allowedOrigins = [
-      'http://localhost:5173',
-      'http://localhost:3000',
-      process.env.CLIENT_URL,
-      process.env.FRONTEND_URL,
-      'https://essence-io.netlify.app'
-    ];
-    return allowedOrigins.includes(origin) || !origin;
-  }
-});
+// Simple in-memory state (replace with DB or richer game state as needed)
+const clients = new Map();   // clientId -> { ws, player }
+const players = new Map();   // clientId -> playerState
 
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:3000',
-    process.env.CLIENT_URL,
-    process.env.FRONTEND_URL,
-    'https://essence-io.netlify.app'
-  ],
-  credentials: true
-}));
+// Utility: generate a short client id
+function makeClientId() {
+  return Math.random().toString(36).slice(2, 10);
+}
 
-app.use(express.json());
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Essence.io server is running' });
-});
-
-const gameWorld = new GameWorld();
-const clients = new Map();
-
-class ClientConnection {
-  constructor(ws, clientId) {
-    this.ws = ws;
-    this.clientId = clientId;
-    this.player = null;
-    this.lastAckTime = Date.now();
-    this.latency = 0;
-    this.inputBuffer = [];
-    this.isAlive = true;
-  }
-
-  send(message, priority = 'normal') {
-    if (this.ws.readyState === WebSocket.OPEN) {
-      const packet = {
-        id: Math.random(),
-        timestamp: Date.now(),
-        priority,
-        type: message.type,
-        data: message
-      };
-      console.log(`[SERVER SENDING] To client ${this.clientId}:`, packet);
-      this.ws.send(JSON.stringify(packet));
-    }
-  }
-
-  sendBatch(messages) {
-    if (this.ws.readyState === WebSocket.OPEN) {
-      const batch = {
-        type: 'batch',
-        timestamp: Date.now(),
-        messages: messages.map(msg => ({
-          id: Math.random(),
-          ...msg
-        }))
-      };
-      this.ws.send(JSON.stringify(batch));
-    }
+// Safe conversion of raw WebSocket message to string
+function rawToString(rawData) {
+  if (typeof rawData === 'string') return rawData;
+  // WebSocket may pass Buffer or ArrayBuffer
+  if (rawData instanceof Buffer) return rawData.toString('utf8');
+  // ArrayBuffer or TypedArray
+  try {
+    return Buffer.from(rawData).toString('utf8');
+  } catch (err) {
+    return '';
   }
 }
 
-wss.on('connection', (ws) => {
-  const clientId = Math.random().toString(36).substr(2, 9);
-  const connection = new ClientConnection(ws, clientId);
-  clients.set(ws, connection);
+function safeJsonParse(rawStr) {
+  try {
+    return JSON.parse(rawStr);
+  } catch (err) {
+    return null;
+  }
+}
 
-  console.log(`\n[SERVER] ✅ Client connected: ${clientId}`);
+function send(ws, message, priority = 'normal') {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const packet = {
+    ...message,
+    timestamp: Date.now(),
+    priority
+  };
+  try {
+    ws.send(JSON.stringify(packet));
+  } catch (err) {
+    console.error('[SERVER] Failed to send packet to client:', err);
+  }
+}
 
-  connection.send({
+// Broadcast a message to all connected clients
+function broadcast(message, excludeClientId = null) {
+  const serialized = JSON.stringify({
+    ...message,
+    timestamp: Date.now()
+  });
+  clients.forEach((entry, clientId) => {
+    if (clientId === excludeClientId) return;
+    const ws = entry.ws;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(serialized);
+      } catch (err) {
+        console.error('[SERVER] Broadcast send error:', err);
+      }
+    }
+  });
+}
+
+// Create HTTP server (optional) and WebSocket server on top
+const server = http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Essence.io WS server');
+});
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws, req) => {
+  const clientId = makeClientId();
+  console.log('[SERVER] ✅ Client connected:', clientId);
+
+  // store client entry
+  clients.set(clientId, { ws });
+
+  // send init packet
+  send(ws, {
+    id: Math.random(),
     type: 'init',
-    clientId,
-    config: {
-      tickRate: GameConfig.SERVER_TICK_RATE,
-      worldSize: GameConfig.WORLD_SIZE,
-      interpolationDelay: GameConfig.INTERPOLATION_DELAY
+    data: {
+      type: 'init',
+      clientId,
+      config: {
+        tickRate: TICK_RATE,
+        worldSize: WORLD_SIZE,
+        interpolationDelay: INTERPOLATION_DELAY
+      }
     }
   }, 'critical');
 
-  ws.on('message', (rawData) => {
+  // safe message handler
+  ws.on('message', (rawData, isBinary) => {
+    let rawStr = '';
     try {
-      console.log(`\n[SERVER] 📨 Raw message received from ${clientId}:`, rawData.substring(0, 200));
-      
-      const packet = JSON.parse(rawData);
-      console.log(`[SERVER] Parsed packet:`, packet);
-
-      // The packet structure from client is:
-      // { type: 'join', data: {...}, timestamp: ..., priority: 'critical' }
-      const messageType = packet.type;
-      console.log(`[SERVER] Message type: ${messageType}`);
-
-      switch (messageType) {
-        case 'join':
-          console.log(`[SERVER] 🎮 HANDLING JOIN`);
-          // packet.data contains the actual message data
-          const joinPayload = packet.data.data || packet.data;
-          console.log(`[SERVER] Join payload:`, joinPayload);
-          handlePlayerJoin(connection, joinPayload);
-          break;
-
-        case 'input':
-          console.log(`[SERVER] 📥 Handling input`);
-          const inputPayload = packet.data.input || packet.data;
-          handlePlayerInput(connection, inputPayload);
-          break;
-
-        case 'ping':
-          console.log(`[SERVER] 🏓 Handling ping`);
-          handlePing(connection, packet);
-          break;
-
-        case 'ack':
-          connection.lastAckTime = Date.now();
-          break;
-
-        default:
-          console.warn(`[SERVER] ⚠️ Unknown message type: ${messageType}`);
+      rawStr = rawToString(rawData);
+      const preview = rawStr.length > 500 ? rawStr.substring(0, 500) + '... (truncated)' : rawStr;
+      // Try to parse JSON
+      const msg = safeJsonParse(rawStr);
+      if (!msg) {
+        console.error('[SERVER ERROR] Failed to parse message: invalid JSON. Preview:', preview);
+        return;
       }
-    } catch (error) {
-      console.error(`[SERVER ERROR] Failed to parse message: ${error.message}`);
-      console.error(`[SERVER ERROR] Stack:`, error.stack);
-      console.error(`[SERVER ERROR] Raw data:`, rawData.substring(0, 500));
+
+      // handle batch packets or single messages
+      if (msg.type === 'batch' && Array.isArray(msg.messages)) {
+        msg.messages.forEach(m => handleClientMessage(clientId, m));
+      } else {
+        handleClientMessage(clientId, msg);
+      }
+    } catch (err) {
+      // defensive: log as much as we can without assuming rawData is string
+      console.error('[SERVER ERROR] Unexpected error in message handler:', err.stack || err);
+      try {
+        console.error('[SERVER ERROR] Raw data preview:', rawStr.substring(0, 500));
+      } catch (logErr) {
+        console.error('[SERVER ERROR] Failed to log raw data preview:', logErr);
+      }
     }
   });
 
-  ws.on('close', () => {
-    handlePlayerDisconnect(connection);
-    clients.delete(ws);
-    console.log(`[SERVER] ❌ Client disconnected: ${clientId}`);
+  ws.on('close', (code, reason) => {
+    console.log('[SERVER] Client disconnected:', clientId, { code, reason: reason?.toString?.() || reason });
+    clients.delete(clientId);
+    players.delete(clientId);
+    // broadcast player left
+    broadcast({ type: 'playerLeft', data: { playerId: clientId } }, clientId);
   });
 
-  ws.on('error', (error) => {
-    console.error(`[WEBSOCKET ERROR] ${clientId}: ${error.message}`);
+  ws.on('error', (err) => {
+    console.error('[SERVER] WebSocket error for client', clientId, err);
   });
 });
 
-function handlePlayerJoin(connection, data) {
-  console.log(`\n[SERVER] 🎮 handlePlayerJoin called`);
-  console.log(`[SERVER] Data received:`, data);
-  
-  const playerName = data.playerName || data.name || `Player_${connection.clientId}`;
-  console.log(`[SERVER] Creating player with name: ${playerName}`);
-  
-  try {
-    const player = gameWorld.addPlayer(connection.clientId, playerName);
-    connection.player = player;
-    
-    console.log(`[SERVER] Player created:`, {
+function handleClientMessage(clientId, msg) {
+  // msg may be shaped as { type, data, ... } or nested; normalize
+  const type = msg.type || msg.data?.type;
+  const data = msg.data || msg;
+
+  if (!type) {
+    console.warn('[SERVER] Received message without type from', clientId, 'raw:', msg);
+    return;
+  }
+
+  // Debug log
+  // console.log('[SERVER RECEIVED] From', clientId, type, data);
+
+  switch (type) {
+    case 'join': {
+      // Expect data.playerName or data.playerName inside data
+      const playerName = data.playerName || data.name || 'Player';
+      // create a simple player state
+      const spawnX = Math.floor(Math.random() * WORLD_SIZE.width);
+      const spawnY = Math.floor(Math.random() * WORLD_SIZE.height);
+      const playerState = {
+        id: clientId,
+        name: playerName,
+        position: { x: spawnX, y: spawnY },
+        velocity: { x: 0, y: 0 },
+        rotation: 0,
+        essenceCount: 0,
+        health: 100
+      };
+      players.set(clientId, playerState);
+      // attach to clients entry
+      const entry = clients.get(clientId);
+      if (entry) entry.player = playerState;
+
+      console.log(`[SERVER] Player joined: ${playerName} (${clientId}) at (${spawnX},${spawnY})`);
+
+      // send world snapshot to the joining client (include clientId so client can find itself)
+      const snapshot = buildWorldSnapshot(clientId);
+      const ws = clients.get(clientId)?.ws;
+      if (ws) {
+        send(ws, { id: Math.random(), type: 'worldSnapshot', data: snapshot }, 'critical');
+      }
+
+      // announce to others that a new player joined
+      broadcast({ id: Math.random(), type: 'playerJoined', data: { playerId: clientId, playerData: playerState } }, clientId);
+      break;
+    }
+
+    case 'input': {
+      // Client sends input updates; apply to player state (basic example)
+      const p = players.get(clientId);
+      if (!p) return;
+      const input = data.input || data;
+      const keys = input.keys || [];
+      // very simple movement application for demo; server authoritative update would be more complex
+      const speed = 150;
+      let dx = 0, dy = 0;
+      if (keys.includes('w') || keys.includes('ArrowUp')) dy -= 1;
+      if (keys.includes('s') || keys.includes('ArrowDown')) dy += 1;
+      if (keys.includes('a') || keys.includes('ArrowLeft')) dx -= 1;
+      if (keys.includes('d') || keys.includes('ArrowRight')) dx += 1;
+      // normalize
+      const mag = Math.hypot(dx, dy) || 1;
+      dx = dx / mag;
+      dy = dy / mag;
+      // apply small step (note: this handler is called at variable frequency; you should instead store input and apply in tick loop)
+      p.position.x = Math.max(0, Math.min(WORLD_SIZE.width, p.position.x + dx * 5));
+      p.position.y = Math.max(0, Math.min(WORLD_SIZE.height, p.position.y + dy * 5));
+      p.velocity.x = dx * speed;
+      p.velocity.y = dy * speed;
+      p.rotation = Math.atan2(dy, dx);
+      break;
+    }
+
+    case 'ping': {
+      // client ping -> respond with 'pong' including serverTime
+      const ws = clients.get(clientId)?.ws;
+      if (ws) {
+        send(ws, { id: Math.random(), type: 'pong', data: { serverTime: Date.now() } }, 'critical');
+      }
+      break;
+    }
+
+    default:
+      // unknown: ignore or log
+      // console.warn('[SERVER] No handler for message type:', type);
+      break;
+  }
+}
+
+function buildWorldSnapshot(forClientId = null) {
+  // simple snapshot with players, essences (none here), npcs (none)
+  const playerList = [];
+  players.forEach(player => {
+    playerList.push({
       id: player.id,
       name: player.name,
-      position: player.position
+      position: { ...player.position },
+      velocity: { ...player.velocity },
+      rotation: player.rotation,
+      essenceCount: player.essenceCount,
+      health: player.health
     });
-    
-    const snapshot = gameWorld.getWorldSnapshot(player.id);
-    console.log(`[SERVER] Generated snapshot:`, {
-      clientId: connection.clientId,
-      playersCount: snapshot.players?.length || 0,
-      essencesCount: snapshot.essences?.length || 0,
-      npcsCount: snapshot.npcs?.length || 0
-    });
-    
-    // Send worldSnapshot with the exact structure the client expects
-    const worldSnapshotMessage = {
-      type: 'worldSnapshot',
-      clientId: connection.clientId,
-      players: snapshot.players || [],
-      essences: snapshot.essences || [],
-      npcs: snapshot.npcs || []
-    };
-    
-    console.log(`[SERVER] 📤 Sending worldSnapshot to ${playerName}`);
-    connection.send(worldSnapshotMessage, 'critical');
-    console.log(`[SERVER] ✅ worldSnapshot sent!`);
-
-    // Notify other players
-    broadcastToAllExcept(connection, {
-      type: 'playerJoined',
-      playerId: player.id,
-      playerData: player.getPublicData()
-    });
-
-    console.log(`[GAME] 👤 ${playerName} joined the game`);
-  } catch (error) {
-    console.error(`[SERVER ERROR] Failed to create player: ${error.message}`);
-    console.error(error.stack);
-  }
-}
-
-function handlePlayerInput(connection, data) {
-  if (!connection.player) return;
-
-  connection.inputBuffer.push({
-    timestamp: data.timestamp,
-    input: data.input
-  });
-}
-
-function handlePing(connection, packet) {
-  const latency = Date.now() - packet.timestamp;
-  connection.latency = latency;
-  
-  connection.send({
-    type: 'pong',
-    timestamp: packet.timestamp,
-    serverTime: Date.now()
-  });
-}
-
-function handlePlayerDisconnect(connection) {
-  if (connection.player) {
-    gameWorld.removePlayer(connection.player.id);
-    
-    broadcastToAll({
-      type: 'playerLeft',
-      playerId: connection.player.id
-    });
-
-    console.log(`[GAME] 👤 ${connection.player.name} left the game`);
-  }
-}
-
-function broadcastToAll(message, priority = 'normal') {
-  clients.forEach((connection) => {
-    if (connection.ws.readyState === WebSocket.OPEN) {
-      connection.send(message, priority);
-    }
-  });
-}
-
-function broadcastToAllExcept(excludeConnection, message, priority = 'normal') {
-  clients.forEach((connection) => {
-    if (connection !== excludeConnection && connection.ws.readyState === WebSocket.OPEN) {
-      connection.send(message, priority);
-    }
-  });
-}
-
-const TICK_INTERVAL = 1000 / GameConfig.SERVER_TICK_RATE;
-let lastTickTime = Date.now();
-
-function serverGameLoop() {
-  const now = Date.now();
-  const deltaTime = (now - lastTickTime) / 1000;
-
-  clients.forEach((connection) => {
-    if (connection.player && connection.inputBuffer.length > 0) {
-      const input = connection.inputBuffer.shift();
-      gameWorld.processPlayerInput(connection.player.id, input.input);
-    }
   });
 
-  gameWorld.update(deltaTime);
-
-  const stateUpdates = gameWorld.getDeltaUpdates();
-  
-  clients.forEach((connection) => {
-    if (!connection.player) return;
-
-    const relevantUpdates = filterRelevantUpdates(
-      connection.player,
-      stateUpdates,
-      GameConfig.VISIBILITY_DISTANCE
-    );
-
-    if (relevantUpdates.length > 0) {
-      connection.sendBatch([
-        {
-          type: 'stateUpdate',
-          tick: gameWorld.tick,
-          updates: relevantUpdates,
-          timestamp: now
-        }
-      ]);
-    }
-  });
-
-  lastTickTime = now;
+  return {
+    type: 'worldSnapshot',
+    clientId: forClientId,
+    players: playerList,
+    essences: [], // fill with essences as you implement them
+    npcs: []
+  };
 }
 
-function filterRelevantUpdates(player, updates, visibilityDistance) {
-  return updates.filter(update => {
-    if (!update.entity || !update.entity.position) return true;
-    
-    const distance = Math.hypot(
-      update.entity.position.x - player.position.x,
-      update.entity.position.y - player.position.y
-    );
-    return distance <= visibilityDistance;
-  });
-}
-
-setInterval(serverGameLoop, TICK_INTERVAL);
-
+// Periodic tick to broadcast world snapshots
 setInterval(() => {
-  const now = Date.now();
-  clients.forEach((connection) => {
-    if (!connection.isAlive) {
-      connection.ws.terminate();
-      return;
-    }
-    connection.isAlive = false;
-    connection.send({ type: 'ping', timestamp: now }, 'critical');
-  });
-}, 30000);
+  if (players.size === 0) return;
+  const snapshot = buildWorldSnapshot(null);
+  broadcast({ id: Math.random(), type: 'worldSnapshot', data: snapshot }, null);
+}, 1000 / TICK_RATE);
 
-const PORT = process.env.PORT || 3001;
+// start server
 server.listen(PORT, () => {
-  console.log(`\n🎮 [SERVER] Essence.io Server running on port ${PORT}`);
-  console.log(`📡 WebSocket: ws://localhost:${PORT}`);
-  console.log(`🌐 Environment: ${process.env.NODE_ENV}`);
-  console.log(`✅ Ready for connections!\n`);
+  console.log(`[SERVER] Listening on port ${PORT}`);
 });
-
-module.exports = { server, gameWorld };
